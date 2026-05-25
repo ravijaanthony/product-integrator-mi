@@ -168,8 +168,11 @@ public class RDBMSMemberEventListenerTask implements Runnable {
             if (setUnresponsive) {
                 if (!wasMemberUnresponsive) {
                     log.warn("Node [" + nodeID + "] in group [" + localGroupId + "] has become unresponsive.");
-                    notifyUnresponsiveness(nodeID, localGroupId);
+                    // Set the flag BEFORE notifyUnresponsiveness so that even if listener callbacks block or throw,
+                    // the recovery branch in RDBMSCoordinationStrategy:449 still fires on the next iteration.
                     wasMemberUnresponsive = true;
+                    log.info("wasMemberUnresponsive set to TRUE for node [" + nodeID + "]");
+                    notifyUnresponsiveness(nodeID, localGroupId);
                 }
             } else {
                 wasMemberUnresponsive = false;

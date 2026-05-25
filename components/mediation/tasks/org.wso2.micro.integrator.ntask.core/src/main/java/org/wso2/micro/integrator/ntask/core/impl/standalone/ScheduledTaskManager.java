@@ -285,6 +285,25 @@ public class ScheduledTaskManager extends AbstractQuartzTaskManager {
         locallyRunningCoordinatedTasks.remove(taskName);
     }
 
+    /**
+     * Pause every locally running coordinated task in a single synchronized pass. Both
+     * TaskEventListener.becameUnresponsive (heartbeat thread) and CoordinatedTaskScheduler.run's
+     * finally block (polling thread) call this; they serialize on the `this` monitor — same monitor
+     * as the inherited pauseLocalTaskTemporarily / scheduleLocalTask methods. The snapshot is taken
+     * inside the lock so a concurrent caller sees the post-removal residue (typically empty).
+     */
+    @Override
+    public synchronized void pauseAllLocallyRunningTasks() {
+        List<String> tasks = new ArrayList<>(locallyRunningCoordinatedTasks);
+        tasks.forEach(task -> {
+            try {
+                stopExecutionTemporarily(task);
+            } catch (Throwable t) {
+                log.error("Unable to pause the task " + task, t);
+            }
+        });
+    }
+
     private void scheduleTask(String taskName) throws TaskException {
         if (this.isMyTaskTypeRegistered()) {
             this.scheduleLocalTask(taskName);

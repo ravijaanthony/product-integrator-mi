@@ -79,6 +79,14 @@ public interface TaskManager {
     void removeTaskFromLocallyRunningTaskList(String taskName);
 
     /**
+     * Pause every locally running coordinated task in a single synchronized pass. Safe to call from
+     * multiple threads (TaskEventListener.becameUnresponsive and CoordinatedTaskScheduler.run's
+     * finally block); the second caller serializes on the same monitor and sees an empty / residue
+     * list because stopExecutionTemporarily removes from the running list as it goes.
+     */
+    void pauseAllLocallyRunningTasks();
+
+    /**
      * Handles the pause operation for the task with the given name.
      *
      * @param taskName The name of the task

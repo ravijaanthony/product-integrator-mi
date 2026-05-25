@@ -150,12 +150,26 @@ public class CoordinatedTaskScheduler implements Runnable {
             recordRunningTaskObservations();
             checkInterrupted();
         } catch (InterruptedException ie) {
-            // Expected during becameUnresponsive: shutdownNow interrupted this polling iteration.
+            // Expected during becameUnresponsive — shutdownNow interrupted this polling iteration.
             // Not an error; cleanup runs in the finally block below.
             LOG.warn("Coordinated task scheduler iteration interrupted"
                     + "; exiting current iteration. Cleanup will run in finally block. ", ie);
         } catch (Throwable throwable) { // catching throwable to prohibit permanent stopping of the executor service.
             LOG.fatal("Unexpected error occurred while trying to schedule tasks.", throwable);
+        } finally {
+            // Backstop cleanup. If shutdownNow set the interrupt flag (TaskEventListener.becameUnresponsive
+            // ran) OR dataHolder cleared the scheduler reference, drain anything this iteration may have added to
+            // locallyRunningCoordinatedTasks before exiting. pauseAllLocallyRunningTasks is synchronized and idempotent —
+            // serializes with the heartbeat thread's call and the second caller's snapshot is empty/residue.
+            if (Thread.currentThread().isInterrupted() || DataHolder.getInstance().getTaskScheduler() == null) {
+                try {
+                    LOG.warn("Coordinated Task Scheduler is shutting down And Interrupt Detected. "
+                            + "Pausing all locally running tasks as part of final cleanup.");
+                    taskManager.pauseAllLocallyRunningTasks();
+                } catch (Throwable t) {
+                    LOG.error("Cleanup in finally failed.", t);
+                }
+            }
         }
     }
 
@@ -281,27 +295,15 @@ public class CoordinatedTaskScheduler implements Runnable {
     }
 
     /**
-     * Check if the task is interrupted.
-     *
-     * @throws TaskCoordinationException when something goes wrong connecting to the store
+     * Check if the task is interrupted. Cleanup is no longer done here — the finally block in run()
+     * is the single ownership point so that the heartbeat thread (TaskEventListener.becameUnresponsive)
+     * and the polling thread never iterate JmsConsumer.cleanup concurrently on the same consumer.
      */
     private void checkInterrupted() throws InterruptedException {
 
         if (Thread.currentThread().isInterrupted()) {
-            try {
-                List<String> tasks = taskManager.getLocallyRunningCoordinatedTasks();
-                // stop all running coordinated tasks.
-                tasks.forEach(task -> {
-                    try {
-                        taskManager.stopExecutionTemporarily(task);
-                    } catch (TaskException e) {
-                        LOG.error("Unable to pause the task " + task, e);
-                    }
-                });
-            } finally {
-                Thread.currentThread().interrupt();
-                throw new InterruptedException("Task was interrupted.");
-            }
+            Thread.currentThread().interrupt();
+            throw new InterruptedException("Thread was interrupted By the TaskEventListener.becameUnresponsive.");
         }
     }
 

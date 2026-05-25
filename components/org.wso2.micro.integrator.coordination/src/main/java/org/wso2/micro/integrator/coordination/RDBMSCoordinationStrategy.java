@@ -360,15 +360,18 @@ public class RDBMSCoordinationStrategy implements CoordinationStrategy {
                     if (lastHeartbeatFinishedTime != 0 &&
                         ((taskEndedTime - (lastHeartbeatFinishedTime + heartBeatInterval))
                          >= heartbeatWarningMargin)) {
-                        log.warn("The heartBeatInterval is in " + heartBeatInterval +
-                                 " millis with a retry count of " + heartbeatMaxRetry + ". " +
-                                 "But current heartbeat has happened after " +
-                                 (currentHeartbeatStartedTime - lastHeartbeatFinishedTime) +
-                                 " millis from the last heartbeat, and took " +
-                                 (taskEndedTime - currentHeartbeatStartedTime) +
-                                 " millis to run CoordinationElection on the database at " +
-                                 currentHeartbeatStartedTime +
-                                 ". Please increase the heartBeat interval or the retry count.");
+                        log.warn("Heartbeat iteration took "
+                                 + (taskEndedTime - currentHeartbeatStartedTime) + "ms (expected ~"
+                                 + heartBeatInterval + "ms; heart_beat_max_retry=" + heartbeatMaxRetry
+                                 + "; gap from previous iteration: "
+                                 + (currentHeartbeatStartedTime - lastHeartbeatFinishedTime)
+                                 + "ms; iteration started at " + currentHeartbeatStartedTime + "). "
+                                 + "If this cycle triggered an unresponsive event, the "
+                                 + inactiveIntervalAfterUnresponsive
+                                 + "ms inactive-interval sleep is included — expected post-DB-recovery "
+                                 + "timing (look for a preceding 'Coordination DB delay' warning). "
+                                 + "Otherwise the heartbeat itself is slow; please increase the "
+                                 + "heart_beat_interval or the heart_beat_max_retry.");
                     }
                     lastHeartbeatFinishedTime = currentHeartbeatStartedTime;
                     if (lastHeartbeatFinishedTime + heartBeatInterval - taskEndedTime > 5) {
@@ -488,6 +491,9 @@ public class RDBMSCoordinationStrategy implements CoordinationStrategy {
                     // Sleep for the duration of the inactiveIntervalAfterUnresponsive to allow time for the database to
                     // recover and give other nodes to take over the coordinator role and/or remove the node from the
                     // group.
+                    log.info("Entering inactive period after coordinationDB error — sleeping "
+                            + inactiveIntervalAfterUnresponsive + "ms to allow DB recovery and let other nodes "
+                            + "take over the coordinator role / remove this node from the group.");
                     Thread.sleep(inactiveIntervalAfterUnresponsive);
                 } catch (InterruptedException ex) {
                     // ignore
@@ -715,7 +721,10 @@ public class RDBMSCoordinationStrategy implements CoordinationStrategy {
          * @param logMessage  log message
          */
         private void handleDatabaseDelay(String nodeId, String groupId, Exception e, String logMessage) {
-            log.warn(logMessage + " Make task Sleep for the duration of : " + inactiveIntervalAfterUnresponsive , e);
+            log.warn(logMessage + " Coordination DB delay — call exceeded maxDBReadTime="
+                    + maxDBReadTime + "ms. heart_beat_interval=" + heartBeatInterval
+                    + "ms x heart_beat_max_retry=" + heartbeatMaxRetry + " (tolerance ~"
+                    + heartbeatMaxRetryInterval + "ms) insufficient for observed DB latency. ", e);
             setUnresponsiveness(nodeId, groupId);
         }
 
