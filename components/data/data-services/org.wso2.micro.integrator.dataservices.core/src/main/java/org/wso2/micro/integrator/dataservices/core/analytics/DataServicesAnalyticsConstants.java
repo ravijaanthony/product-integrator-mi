@@ -23,8 +23,11 @@ public class DataServicesAnalyticsConstants {
     private DataServicesAnalyticsConstants() {}
 
     // ---- MessageContext property keys ----
+    // Anchors latency measurement AND acts as the "open entry" gate for
+    // publish-once-per-invocation. reportEntryEvent sets it; publish() reads
+    // it (null => no entry was opened, so skip) and clears it on success so
+    // chained invocations on the same axis2 MessageContext each get to emit.
     public static final String DS_ANALYTICS_START_TIME = "DS_ANALYTICS_START_TIME";
-    public static final String DS_ANALYTICS_PUBLISHED  = "DS_ANALYTICS_PUBLISHED";
 
     // ---- Explicit overrides for paths where the axis2 context doesn't expose
     //      the right values (OData runs in Synapse mediation; DSS Call Mediator
@@ -38,6 +41,11 @@ public class DataServicesAnalyticsConstants {
 
     // ---- Axis2 property carrying the inbound request URL. ----
     public static final String TRANSPORT_IN_URL_PROPERTY = "TransportInURL";
+
+    // ---- Synapse's catch-all axis operation name; we never want to emit it
+    //      as the analytics operationName because it wins inside the
+    //      OData / DSS Call Mediator paths and produces useless data. ----
+    public static final String SYNAPSE_MEDIATE_OPERATION = "mediate";
 
     // ---- Entity type discriminator (lands in payload.entityType). PascalCase to
     //      match the WSO2 convention (API, ProxyService, SequenceMediator, ...).
@@ -76,7 +84,6 @@ public class DataServicesAnalyticsConstants {
     public static final String FIELD_REMOTE_HOST          = "remoteHost";
     public static final String FIELD_HTTP_METHOD          = "httpMethod";
     public static final String FIELD_HTTP_URL             = "httpUrl";
-    public static final String FIELD_HTTP_STATUS_CODE     = "httpStatusCode";
 
     // ---- JSON field names (dataServiceDetails sub-object) ----
     public static final String FIELD_DETAILS_NAME      = "name";
@@ -86,6 +93,7 @@ public class DataServicesAnalyticsConstants {
     // ---- JSON field names (free-form metadata bag — error info lives here) ----
     public static final String METADATA_ERROR_CODE    = "errorCode";
     public static final String METADATA_ERROR_MESSAGE = "errorMessage";
+    public static final String METADATA_FAULT_DETAIL  = "faultDetail";
 
     // ---- Schema version constant ----
     public static final int SCHEMA_VERSION = 1;
@@ -94,6 +102,5 @@ public class DataServicesAnalyticsConstants {
     public static final String HTTP_METHOD_PROPERTY       = "HTTP_METHOD_OBJECT";
     public static final String TRANSPORT_HEADERS_PROPERTY = "TRANSPORT_HEADERS";
     public static final String REMOTE_ADDR_PROPERTY       = "REMOTE_ADDR";
-    public static final String HTTP_RESPONSE_STATUS_CODE  = "HTTP_RESPONSE_STATUS_CODE";
     public static final String CORRELATION_ID_PROPERTY    = "Correlation-ID";
 }

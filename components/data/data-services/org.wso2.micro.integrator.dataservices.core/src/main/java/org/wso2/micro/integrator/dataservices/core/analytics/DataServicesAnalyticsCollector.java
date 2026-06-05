@@ -40,7 +40,10 @@ import static org.wso2.micro.integrator.dataservices.core.analytics.DataServices
  *   - closeEntryEventWithSubType(...)    on success with a non-default sub-type
  *   - closeFlowForcefully(msgCtx, e)     on failure
  *
- * Idempotent: only the FIRST close-style call per message context publishes.
+ * Idempotent: only the FIRST close-style call per message context publishes,
+ * gated by the {@code DS_ANALYTICS_START_TIME} property (set on entry, cleared
+ * on publish). Chained invocations on the same axis2 MessageContext each get to
+ * emit because every entry sets a fresh start time.
  */
 public class DataServicesAnalyticsCollector {
 
@@ -52,11 +55,6 @@ public class DataServicesAnalyticsCollector {
         if (!isAnalyticsEnabled() || msgCtx == null) return;
         try {
             msgCtx.setProperty(DS_ANALYTICS_START_TIME, System.currentTimeMillis());
-            // Reset the per-entry idempotency flag so chained invocations on the
-            // same axis2 MessageContext (e.g. two <dataservicecall> mediators in
-            // the same API flow) each get to publish their own event. Without
-            // this reset, only the first invocation would emit analytics.
-            msgCtx.setProperty(DS_ANALYTICS_PUBLISHED, Boolean.FALSE);
         } catch (Exception e) {
             log.warn("Failed to record DS analytics entry event: " + e.getMessage());
         }
@@ -111,32 +109,22 @@ public class DataServicesAnalyticsCollector {
         event.setHttpMethod((String) msgCtx.getProperty(HTTP_METHOD_PROPERTY));
         event.setHttpUrl(resolveHttpUrl(msgCtx));
 
-        Object statusCode = msgCtx.getProperty(HTTP_RESPONSE_STATUS_CODE);
-        if (statusCode != null) {
-            event.setHttpStatusCode(String.valueOf(statusCode));
-        }
-
         if (error == null) {
             event.setStatus(STATUS_SUCCESS);
         } else {
             event.setStatus(STATUS_FAILURE);
-            if (error instanceof DataServiceFault) {
+            if (error instanceof SyntheticDataServiceFault) {
+                SyntheticDataServiceFault fault = (SyntheticDataServiceFault) error;
+                event.setErrorCode(fault.getCode());
+                // Use getDsFaultMessage() (raw message), NOT getMessage() — the latter
+                // returns the formatted multi-line "DS Fault Message: ...\nDS Code: ..."
+                // string, which would clutter the faultResponse field in Kibana.
+                event.setErrorMessage(fault.getDsFaultMessage());
+                event.setFaultDetail(fault.getDetail());
+            } else if (error instanceof DataServiceFault) {
                 DataServiceFault fault = (DataServiceFault) error;
                 event.setErrorCode(fault.getCode());
-                // The outer DataServiceFault is often a generic wrapper
-                // (e.g. "Error in DS non result invoke.") while the actual
-                // SQL / business detail lives one level down in the cause
-                // chain. Promote the deeper message so dashboards surface
-                // actionable text, and keep the outer wrapper as faultDetail
-                // for full context.
-                String outer = fault.getDsFaultMessage();
-                String deeper = extractCauseFirstLine(fault.getCause());
-                if (deeper != null && !deeper.equals(outer)) {
-                    event.setErrorMessage(deeper);
-                    event.setFaultDetail(outer);
-                } else {
-                    event.setErrorMessage(outer);
-                }
+                event.setErrorMessage(fault.getDsFaultMessage());
             } else {
                 event.setErrorCode(DBConstants.FaultCodes.UNKNOWN_ERROR);
                 event.setErrorMessage(error.getMessage());
@@ -148,38 +136,22 @@ public class DataServicesAnalyticsCollector {
     private static void publish(MessageContext msgCtx, Exception error, String subType) {
         if (!isAnalyticsEnabled() || msgCtx == null) return;
         try {
-            if (Boolean.TRUE.equals(msgCtx.getProperty(DS_ANALYTICS_PUBLISHED))) {
+            // No entry was opened on this MessageContext (analytics disabled at
+            // entry, or already closed by a previous publish on the same flow):
+            // skip without emitting a duplicate.
+            if (msgCtx.getProperty(DS_ANALYTICS_START_TIME) == null) {
                 return;
             }
-            msgCtx.setProperty(DS_ANALYTICS_PUBLISHED, Boolean.TRUE);
 
             DataServiceAnalyticsEvent event = buildEvent(msgCtx, error);
             if (subType != null) {
                 event.setSubType(subType);
             }
             DataServicesAnalyticsPublisher.publish(event);
+            msgCtx.removeProperty(DS_ANALYTICS_START_TIME);
         } catch (Exception e) {
             log.warn("Failed to publish DS analytics event: " + e.getMessage(), e);
         }
-    }
-
-    /**
-     * Pulls the first non-empty line from the immediate cause of a thrown
-     * fault, stripping DSS's conventional {@code "DS Fault Message: "} prefix.
-     * Used to extract a more specific error description than the outer
-     * receiver-wrapper message. Returns {@code null} if the cause is missing
-     * or has no useful message.
-     */
-    private static String extractCauseFirstLine(Throwable cause) {
-        if (cause == null) return null;
-        String msg = cause.getMessage();
-        if (msg == null || msg.isEmpty()) return null;
-        int nl = msg.indexOf('\n');
-        String firstLine = (nl > 0 ? msg.substring(0, nl) : msg).trim();
-        if (firstLine.startsWith("DS Fault Message: ")) {
-            firstLine = firstLine.substring("DS Fault Message: ".length()).trim();
-        }
-        return firstLine.isEmpty() ? null : firstLine;
     }
 
     /**
@@ -226,7 +198,7 @@ public class DataServicesAnalyticsCollector {
 
         if (msgCtx.getAxisOperation() != null && msgCtx.getAxisOperation().getName() != null) {
             String localPart = msgCtx.getAxisOperation().getName().getLocalPart();
-            if (localPart != null && !localPart.isEmpty() && !"mediate".equals(localPart)) {
+            if (localPart != null && !localPart.isEmpty() && !SYNAPSE_MEDIATE_OPERATION.equals(localPart)) {
                 return localPart;
             }
         }
@@ -251,6 +223,12 @@ public class DataServicesAnalyticsCollector {
      * underlying {@code DataServiceProcessor.dispatch(...)} returns a fault
      * payload instead of throwing — common for validation errors. Returns
      * {@code null} if the result is a normal payload.
+     *
+     * <p>Captures the {@code <detail>} child element in addition to
+     * {@code faultcode} and {@code faultstring}: detail text goes into
+     * {@link SyntheticDataServiceFault#getDetail()} verbatim if present, or
+     * the first child element is serialized to XML if {@code <detail>} wraps
+     * structured content.
      */
     static DataServiceFault extractFaultFromResult(OMElement result) {
         if (result == null) return null;
@@ -262,6 +240,7 @@ public class DataServicesAnalyticsCollector {
         }
         String code = null;
         String message = null;
+        String detail = null;
         Iterator<?> children = result.getChildElements();
         while (children.hasNext()) {
             Object child = children.next();
@@ -273,11 +252,41 @@ public class DataServicesAnalyticsCollector {
                 code = el.getText();
             } else if ("faultstring".equalsIgnoreCase(n) && message == null) {
                 message = el.getText();
+            } else if ("detail".equalsIgnoreCase(n) && detail == null) {
+                detail = extractDetail(el);
             }
         }
         if (code == null) code = "DS_FAULT";
         if (message == null) message = "Data service returned a fault response";
-        return new DataServiceFault(code, message);
+        return new SyntheticDataServiceFault(code, message, detail);
+    }
+
+    /**
+     * If {@code <detail>} wraps a child element (SOAP-style), serialize that
+     * element to XML so dashboards keep the structured info. Otherwise return
+     * the trimmed text content. Returns {@code null} when empty.
+     */
+    private static String extractDetail(OMElement detailEl) {
+        OMElement firstChild = null;
+        Iterator<?> kids = detailEl.getChildren();
+        while (kids.hasNext()) {
+            Object kid = kids.next();
+            if (kid instanceof OMElement) {
+                firstChild = (OMElement) kid;
+                break;
+            }
+        }
+        if (firstChild != null) {
+            try {
+                return firstChild.toString();
+            } catch (Exception e) {
+                // Fall through to text fallback.
+            }
+        }
+        String text = detailEl.getText();
+        if (text == null) return null;
+        String trimmed = text.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private static String stringProperty(MessageContext msgCtx, String key) {
@@ -320,22 +329,45 @@ public class DataServicesAnalyticsCollector {
             Map headers = (Map) headersObj;
             Object xff = headers.get("X-Forwarded-For");
             if (xff != null) return xff.toString();
-            Object host = headers.get("Host");
-            if (host != null) return host.toString();
         }
+        // Deliberately no "Host" header fallback: Host identifies the
+        // server/vhost the client called, not the client itself, so using
+        // it as remoteHost skews top-clients analytics toward the server's
+        // own hostname.
         return null;
     }
 
     /**
-     * Enabled toggle, sourced from the same {@code synapse.properties}
-     * file that the existing {@code ElasticStatisticsPublisher} reads.
-     * A {@code -Danalytics.enabled=true} JVM flag overrides the file.
-     *
-     * <p>We cannot call into {@code ElasticStatisticsPublisher} or
-     * {@code SynapsePropertiesLoader} directly because both paths
-     * create a Maven cycle. See {@link AnalyticsConfig}.
+     * Two-layer enable check: global {@code analytics.enabled} AND the
+     * Data Services-specific {@code analytics.data_service_analytics.enabled}
+     * toggle. Both must be on for the collector to do anything; flipping
+     * either to false disables DS analytics emission without affecting the
+     * Synapse-side publishers.
      */
     private static boolean isAnalyticsEnabled() {
-        return AnalyticsConfig.isAnalyticsEnabled();
+        return AnalyticsConfig.isAnalyticsEnabled()
+                && AnalyticsConfig.isDataServiceAnalyticsEnabled();
+    }
+
+    /**
+     * In-memory-only {@link DataServiceFault} extension used to carry the
+     * captured {@code <detail>} payload from an extractFaultFromResult-derived
+     * synthetic fault into the analytics event. Never thrown or surfaced to
+     * callers — package-private to keep it an analytics-internal carrier.
+     */
+    private static final class SyntheticDataServiceFault extends DataServiceFault {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String detail;
+
+        SyntheticDataServiceFault(String code, String message, String detail) {
+            super(code, message);
+            this.detail = detail;
+        }
+
+        String getDetail() {
+            return detail;
+        }
     }
 }

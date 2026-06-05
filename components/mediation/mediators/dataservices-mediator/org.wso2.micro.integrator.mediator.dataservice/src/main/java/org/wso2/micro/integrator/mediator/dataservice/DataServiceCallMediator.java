@@ -263,6 +263,9 @@ public class DataServiceCallMediator extends AbstractMediator {
 
         } catch (AxisFault axisFault) {
             DataServicesTracingCollector.closeFlowForcefully(axis2MessageContext, DATA_SERVICE_INDEX, axisFault);
+            DataServicesAnalyticsCollector.closeFlowForcefullyWithSubType(
+                    axis2MessageContext, axisFault,
+                    DataServicesAnalyticsConstants.SUB_TYPE_DSS_CALL_MEDIATOR);
             if (synLog.isTraceOrDebugEnabled()) {
                 synLog.traceOrDebug(axisFault.getMessage());
             }

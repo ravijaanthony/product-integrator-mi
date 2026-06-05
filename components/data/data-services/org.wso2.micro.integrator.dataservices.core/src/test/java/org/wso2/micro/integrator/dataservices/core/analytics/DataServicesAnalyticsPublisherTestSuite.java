@@ -63,6 +63,7 @@ public class DataServicesAnalyticsPublisherTestSuite extends TestCase {
         assertFalse(payload.getBoolean("faultResponse"));
         assertTrue("metadata bag is always present", payload.has("metadata"));
         assertEquals(0, payload.getJSONObject("metadata").length());
+        assertFalse("httpStatusCode is no longer part of the schema", payload.has("httpStatusCode"));
 
         JSONObject details = payload.getJSONObject("dataServiceDetails");
         assertEquals("SampleDataService", details.getString("name"));
@@ -83,6 +84,21 @@ public class DataServicesAnalyticsPublisherTestSuite extends TestCase {
         JSONObject metadata = payload.getJSONObject("metadata");
         assertEquals("DATABASE_ERROR",      metadata.getString("errorCode"));
         assertEquals("connection refused",  metadata.getString("errorMessage"));
+        assertFalse("faultDetail omitted when unset", metadata.has("faultDetail"));
+    }
+
+    public void testFaultDetailSurfacedInMetadataWhenPresent() {
+        event.setStatus(DataServicesAnalyticsConstants.STATUS_FAILURE);
+        event.setErrorCode("DATABASE_ERROR");
+        event.setErrorMessage("query failed");
+        event.setFaultDetail("ORA-00942: table or view does not exist");
+
+        JSONObject metadata = DataServicesAnalyticsPublisher.buildJson(event)
+                .getJSONObject("payload")
+                .getJSONObject("metadata");
+
+        assertEquals("ORA-00942: table or view does not exist",
+                metadata.getString("faultDetail"));
     }
 
     public void testTimestampLandsAtRoot_notInPayload() {
@@ -125,6 +141,7 @@ public class DataServicesAnalyticsPublisherTestSuite extends TestCase {
         // surface it (matches how the existing publisher behaves).
         event.setErrorCode("WILL_BE_IGNORED");
         event.setErrorMessage("ignored on success");
+        event.setFaultDetail("also ignored on success");
 
         JSONObject metadata = DataServicesAnalyticsPublisher.buildJson(event)
                 .getJSONObject("payload")

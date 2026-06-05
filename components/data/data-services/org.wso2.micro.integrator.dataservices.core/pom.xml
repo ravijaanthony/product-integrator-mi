@@ -91,6 +91,19 @@
             <artifactId>mysql-connector-java</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Servlet 3.1 API on the compile classpath only. ODataServiceHandler
+             overrides Servlet 3.1 methods (getContentLengthLong, changeSessionId,
+             upgrade, HttpUpgradeHandler) that aren't in equinox javax.servlet:3.0.0.
+             scope=provided: the OSGi container supplies javax.servlet.* at runtime
+             via Import-Package, so this jar must NOT be on the runtime classpath
+             nor pulled transitively into downstream modules (that's the same
+             reason the synapse-core / ndatasource.core servlet exclusions exist). -->
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>3.1.0</version>
+            <scope>provided</scope>
+        </dependency>
         <dependency>
             <groupId>org.eclipse.equinox</groupId>
             <artifactId>javax.servlet</artifactId>

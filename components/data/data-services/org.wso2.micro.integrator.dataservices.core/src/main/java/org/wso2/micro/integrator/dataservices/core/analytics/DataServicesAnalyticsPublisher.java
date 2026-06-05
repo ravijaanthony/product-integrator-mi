@@ -52,7 +52,6 @@ import static org.wso2.micro.integrator.dataservices.core.analytics.DataServices
  *     },
  *     "httpMethod":     "GET",        // optional
  *     "httpUrl":        "/services/...",
- *     "httpStatusCode": "200",
  *     "remoteHost":     "10.0.0.5"
  *   }
  * }
@@ -114,6 +113,7 @@ public class DataServicesAnalyticsPublisher {
         if (isFailure) {
             putIfNotNull(metadata, METADATA_ERROR_CODE,    event.getErrorCode());
             putIfNotNull(metadata, METADATA_ERROR_MESSAGE, event.getErrorMessage());
+            putIfNotNull(metadata, METADATA_FAULT_DETAIL,  event.getFaultDetail());
         }
 
         JSONObject payload = new JSONObject();
@@ -129,7 +129,6 @@ public class DataServicesAnalyticsPublisher {
         putIfNotNull(payload, FIELD_CORRELATION_ID,   event.getCorrelationId());
         putIfNotNull(payload, FIELD_HTTP_METHOD,      event.getHttpMethod());
         putIfNotNull(payload, FIELD_HTTP_URL,         event.getHttpUrl());
-        putIfNotNull(payload, FIELD_HTTP_STATUS_CODE, event.getHttpStatusCode());
         putIfNotNull(payload, FIELD_REMOTE_HOST,      event.getRemoteHost());
 
         JSONObject root = new JSONObject();

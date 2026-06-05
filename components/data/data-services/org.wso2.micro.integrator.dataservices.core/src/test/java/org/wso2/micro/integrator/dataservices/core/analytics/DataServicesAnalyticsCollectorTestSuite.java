@@ -23,9 +23,16 @@ import org.apache.axiom.om.OMAbstractFactory;
 import org.apache.axiom.om.OMElement;
 import org.apache.axiom.om.OMFactory;
 import org.apache.axiom.om.OMNamespace;
+import org.apache.axis2.AxisFault;
 import org.apache.axis2.context.MessageContext;
+import org.apache.axis2.description.AxisOperation;
 import org.apache.axis2.description.AxisService;
+import org.apache.axis2.description.InOnlyAxisOperation;
 import org.wso2.micro.integrator.dataservices.core.DataServiceFault;
+
+import javax.xml.namespace.QName;
+import java.util.HashMap;
+import java.util.Map;
 
 public class DataServicesAnalyticsCollectorTestSuite extends TestCase {
 
@@ -63,6 +70,7 @@ public class DataServicesAnalyticsCollectorTestSuite extends TestCase {
         assertEquals(DataServicesAnalyticsConstants.STATUS_FAILURE, e.getStatus());
         assertEquals("DATABASE_ERROR", e.getErrorCode());
         assertEquals("connection refused", e.getErrorMessage());
+        assertNull("Plain DataServiceFault has no detail to surface", e.getFaultDetail());
     }
 
     public void testBuildEventGenericExceptionSetsUnknownErrorCode() {
@@ -90,14 +98,65 @@ public class DataServicesAnalyticsCollectorTestSuite extends TestCase {
         code.setText("soapenv:Server");
         faultElement.addChild(code);
         OMElement faultString = fac.createOMElement("faultstring", ns);
-        faultString.setText("Value type miss match");
+        faultString.setText("Value type mismatch");
         faultElement.addChild(faultString);
 
         DataServiceFault synthesized = DataServicesAnalyticsCollector.extractFaultFromResult(faultElement);
 
         assertNotNull("Fault element must be detected", synthesized);
         assertEquals("soapenv:Server", synthesized.getCode());
-        assertEquals("Value type miss match", synthesized.getDsFaultMessage());
+        assertEquals("Value type mismatch", synthesized.getDsFaultMessage());
+    }
+
+    public void testExtractFaultFromResult_capturesDetailText() {
+        OMFactory fac = OMAbstractFactory.getOMFactory();
+        OMNamespace ns = fac.createOMNamespace("", "");
+        OMElement faultElement = fac.createOMElement("Fault", ns);
+        OMElement code = fac.createOMElement("faultcode", ns);
+        code.setText("DATABASE_ERROR");
+        faultElement.addChild(code);
+        OMElement faultString = fac.createOMElement("faultstring", ns);
+        faultString.setText("query failed");
+        faultElement.addChild(faultString);
+        OMElement detail = fac.createOMElement("detail", ns);
+        detail.setText("ORA-00942: table or view does not exist");
+        faultElement.addChild(detail);
+
+        DataServiceFault synthesized = DataServicesAnalyticsCollector.extractFaultFromResult(faultElement);
+
+        // The collector emits the detail via SyntheticDataServiceFault, which
+        // is package-private. Exercise the same code path buildEvent uses so
+        // we don't need to reach the private inner class directly.
+        DataServiceAnalyticsEvent event = DataServicesAnalyticsCollector.buildEvent(msgCtx, synthesized);
+        assertEquals("ORA-00942: table or view does not exist", event.getFaultDetail());
+    }
+
+    public void testExtractFaultFromResult_capturesNestedDetailElement() {
+        OMFactory fac = OMAbstractFactory.getOMFactory();
+        OMNamespace ns = fac.createOMNamespace("", "");
+        OMElement faultElement = fac.createOMElement("Fault", ns);
+        OMElement code = fac.createOMElement("faultcode", ns);
+        code.setText("DATABASE_ERROR");
+        faultElement.addChild(code);
+        OMElement faultString = fac.createOMElement("faultstring", ns);
+        faultString.setText("query failed");
+        faultElement.addChild(faultString);
+        OMElement detail = fac.createOMElement("detail", ns);
+        OMNamespace dsNs = fac.createOMNamespace("http://ws.wso2.org/dataservice", "ds");
+        OMElement dsFault = fac.createOMElement("DataServiceFault", dsNs);
+        OMElement nested = fac.createOMElement("nested-error", dsNs);
+        nested.setText("table missing");
+        dsFault.addChild(nested);
+        detail.addChild(dsFault);
+        faultElement.addChild(detail);
+
+        DataServiceFault synthesized = DataServicesAnalyticsCollector.extractFaultFromResult(faultElement);
+        DataServiceAnalyticsEvent event = DataServicesAnalyticsCollector.buildEvent(msgCtx, synthesized);
+        String captured = event.getFaultDetail();
+        assertNotNull("Nested detail element must be captured", captured);
+        // Either an XML serialization or at least the nested marker survives.
+        assertTrue("Expected nested DataServiceFault element in faultDetail; got: " + captured,
+                captured.contains("DataServiceFault") || captured.contains("nested-error"));
     }
 
     public void testExtractFaultFromResult_returnsNullForNormalPayload() {
@@ -114,15 +173,75 @@ public class DataServicesAnalyticsCollectorTestSuite extends TestCase {
         assertNull(DataServicesAnalyticsCollector.extractFaultFromResult(null));
     }
 
-    public void testReportEntryEventResetsPublishedFlag() {
-        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_PUBLISHED, Boolean.TRUE);
+    public void testReportEntryEventOpensGate() {
+        // Whatever the prior state, reportEntryEvent should reopen the gate:
+        // when analytics is enabled, START_TIME becomes a Long; when disabled,
+        // the call is a no-op and START_TIME stays whatever it was (null here).
         DataServicesAnalyticsCollector.reportEntryEvent(msgCtx);
-        // Note: this only resets when analytics is enabled (file-driven). We just
-        // assert that, when enabled, the next entry doesn't see a stale TRUE.
-        // When disabled, the call is a no-op and the property stays TRUE.
-        Object published = msgCtx.getProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_PUBLISHED);
-        // Either FALSE (analytics enabled, reset happened) or TRUE (analytics disabled, no-op).
-        // The important guarantee is: never null / never an unexpected value.
-        assertTrue(Boolean.FALSE.equals(published) || Boolean.TRUE.equals(published));
+        Object start = msgCtx.getProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME);
+        assertTrue("DS_ANALYTICS_START_TIME must be null (analytics disabled) or a Long (enabled)",
+                start == null || start instanceof Long);
+    }
+
+    public void testOperationResolution_overrideWinsOverEverything() {
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_OPERATION_OVERRIDE, "explicit-op");
+        msgCtx.setProperty(DataServicesAnalyticsConstants.MEDIATOR_AXIS_OPERATION_NAME, "mediator-op");
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME, System.currentTimeMillis());
+
+        DataServiceAnalyticsEvent e = DataServicesAnalyticsCollector.buildEvent(msgCtx, null);
+        assertEquals("explicit-op", e.getOperationName());
+    }
+
+    public void testOperationResolution_mediatorPropertyBeatsSoapAction() {
+        msgCtx.setProperty(DataServicesAnalyticsConstants.MEDIATOR_AXIS_OPERATION_NAME, "mediator-op");
+        msgCtx.setSoapAction("urn:soapaction-op");
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME, System.currentTimeMillis());
+
+        DataServiceAnalyticsEvent e = DataServicesAnalyticsCollector.buildEvent(msgCtx, null);
+        assertEquals("mediator-op", e.getOperationName());
+    }
+
+    public void testOperationResolution_skipsSynapseMediateCatchAll() throws AxisFault {
+        // Build a MessageContext whose AxisOperation localPart is "mediate"
+        // (Synapse's catch-all) — must NOT be returned as the operation name.
+        msgCtx.setSoapAction(null);
+        msgCtx.removeProperty(DataServicesAnalyticsConstants.MEDIATOR_AXIS_OPERATION_NAME);
+        msgCtx.removeProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_OPERATION_OVERRIDE);
+        AxisOperation mediateOp = new InOnlyAxisOperation(new QName("mediate"));
+        msgCtx.setAxisOperation(mediateOp);
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME, System.currentTimeMillis());
+
+        DataServiceAnalyticsEvent e = DataServicesAnalyticsCollector.buildEvent(msgCtx, null);
+        assertNull("Synapse's catch-all \"mediate\" must be skipped", e.getOperationName());
+    }
+
+    public void testServiceResolution_overrideWinsOverAxisService() {
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_SERVICE_NAME_OVERRIDE,
+                "EmployeeDataService");
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME, System.currentTimeMillis());
+
+        DataServiceAnalyticsEvent e = DataServicesAnalyticsCollector.buildEvent(msgCtx, null);
+        assertEquals("EmployeeDataService", e.getServiceName());
+    }
+
+    public void testHttpUrlResolution_fallsBackToTransportInURLWhenWsaToIsNull() {
+        // msgCtx.getTo() returns null by default in this setUp().
+        msgCtx.setProperty(DataServicesAnalyticsConstants.TRANSPORT_IN_URL_PROPERTY,
+                "/odata/EmployeeDataService/Employees");
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME, System.currentTimeMillis());
+
+        DataServiceAnalyticsEvent e = DataServicesAnalyticsCollector.buildEvent(msgCtx, null);
+        assertEquals("/odata/EmployeeDataService/Employees", e.getHttpUrl());
+    }
+
+    public void testRemoteHostResolution_doesNotFallBackToHostHeader() {
+        // Host identifies the server, not the client — must NOT be used as remoteHost.
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Host", "api.example.com");
+        msgCtx.setProperty(DataServicesAnalyticsConstants.TRANSPORT_HEADERS_PROPERTY, headers);
+        msgCtx.setProperty(DataServicesAnalyticsConstants.DS_ANALYTICS_START_TIME, System.currentTimeMillis());
+
+        DataServiceAnalyticsEvent e = DataServicesAnalyticsCollector.buildEvent(msgCtx, null);
+        assertNull("Host header must not be used as remote host", e.getRemoteHost());
     }
 }

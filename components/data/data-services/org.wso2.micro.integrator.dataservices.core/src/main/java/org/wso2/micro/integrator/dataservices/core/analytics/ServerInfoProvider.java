@@ -20,80 +20,83 @@ package org.wso2.micro.integrator.dataservices.core.analytics;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.synapse.ServerConfigurationInformation;
+import org.apache.synapse.core.SynapseEnvironment;
 import org.json.JSONObject;
-
-import java.net.InetAddress;
-import java.net.UnknownHostException;
+import org.wso2.micro.integrator.core.util.MicroIntegratorBaseUtils;
 
 /**
  * Computes the {@code serverInfo} envelope block ({@code hostname},
  * {@code serverName}, {@code ipAddress}, {@code id}) using the same field
  * values the Synapse-side {@code ElasticDataSchema} emits for API/Proxy events.
  *
- * <p>We cannot call {@code ServerConfigurationInformation} or
- * {@code ServiceBusInitializer} directly without re-introducing the Maven
- * cycle described in {@link DataServicesAnalyticsPublisher}, so values are
- * resolved as follows:
- * <ul>
- *   <li>{@code hostname} — {@link InetAddress#getLocalHost()} (matches what
- *       {@code ServerConfigurationInformation} stores in practice).</li>
- *   <li>{@code ipAddress} — {@link InetAddress#getLocalHost()} address.</li>
- *   <li>{@code serverName} — {@code carbon.name} system property, falling
- *       back to {@code "localhost"} (the Synapse default).</li>
- *   <li>{@code id} — {@code analytics.id} from {@code synapse.properties},
- *       falling back to {@code hostname}, matching {@code ElasticDataSchema.init()}.</li>
- * </ul>
- * Cached for the JVM lifetime — restart MI to pick up changes.
+ * <p>Sourced from {@link ServerConfigurationInformation} — the canonical
+ * Synapse-side record of the server's identity (populated at startup from
+ * carbon.xml + axis2.xml). This matches exactly what
+ * {@code ElasticDataSchema.init()} uses for the production publisher, so DS
+ * events carry the same identity tuple as API/Proxy events.
+ *
+ * <p>If Synapse hasn't initialized yet (very early startup), the resolution
+ * returns {@code null} fields safely and the call retries on the next event.
  */
 final class ServerInfoProvider {
 
     private static final Log log = LogFactory.getLog(ServerInfoProvider.class);
 
-    private static final String CARBON_NAME_PROPERTY = "carbon.name";
-    private static final String ANALYTICS_ID_KEY     = "analytics.id";
-
-    private static volatile JSONObject cachedServerInfo;
+    private static volatile Snapshot cachedSnapshot;
 
     private ServerInfoProvider() {}
 
     static JSONObject getServerInfo() {
-        JSONObject result = cachedServerInfo;
-        if (result != null) {
-            return result;
+        Snapshot snap = resolveSnapshot();
+        JSONObject info = new JSONObject();
+        if (snap != null) {
+            putIfNotNull(info, "hostname",   snap.hostname);
+            putIfNotNull(info, "serverName", snap.serverName);
+            putIfNotNull(info, "ipAddress",  snap.ipAddress);
+            putIfNotNull(info, "id",         snap.publisherId);
+        }
+        return info;
+    }
+
+    private static Snapshot resolveSnapshot() {
+        Snapshot snap = cachedSnapshot;
+        if (snap != null) {
+            return snap;
         }
         synchronized (ServerInfoProvider.class) {
-            if (cachedServerInfo != null) {
-                return cachedServerInfo;
+            if (cachedSnapshot != null) {
+                return cachedSnapshot;
             }
-            String hostname = resolveHostName();
-            String ipAddress = resolveIpAddress();
-            String serverName = System.getProperty(CARBON_NAME_PROPERTY, "localhost");
-            String publisherId = AnalyticsConfig.getProperty(ANALYTICS_ID_KEY, hostname);
-
-            JSONObject info = new JSONObject();
-            putIfNotNull(info, "hostname",   hostname);
-            putIfNotNull(info, "serverName", serverName);
-            putIfNotNull(info, "ipAddress",  ipAddress);
-            putIfNotNull(info, "id",         publisherId);
-            cachedServerInfo = info;
-            return info;
+            ServerConfigurationInformation info = loadServerInfo();
+            if (info == null) {
+                // Synapse isn't initialized yet — return a transient null so
+                // the next call retries. Don't cache, or we'd be stuck with
+                // empty serverInfo for the JVM lifetime.
+                return null;
+            }
+            String hostname    = info.getHostName();
+            String serverName  = info.getServerName();
+            String ipAddress   = info.getIpAddress();
+            String publisherId = AnalyticsConfig.getPublisherId(hostname);
+            Snapshot fresh = new Snapshot(hostname, serverName, ipAddress, publisherId);
+            cachedSnapshot = fresh;
+            return fresh;
         }
     }
 
-    private static String resolveHostName() {
+    private static ServerConfigurationInformation loadServerInfo() {
         try {
-            return InetAddress.getLocalHost().getHostName();
-        } catch (UnknownHostException e) {
-            log.debug("Unable to resolve local hostname for DS analytics serverInfo: " + e.getMessage());
-            return null;
-        }
-    }
-
-    private static String resolveIpAddress() {
-        try {
-            return InetAddress.getLocalHost().getHostAddress();
-        } catch (UnknownHostException e) {
-            log.debug("Unable to resolve local IP for DS analytics serverInfo: " + e.getMessage());
+            SynapseEnvironment env = MicroIntegratorBaseUtils.getSynapseEnvironment();
+            if (env == null || env.getServerContextInformation() == null) {
+                return null;
+            }
+            return env.getServerContextInformation().getServerConfigurationInformation();
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("Synapse environment not yet available for DS analytics serverInfo: "
+                        + e.getMessage());
+            }
             return null;
         }
     }
@@ -101,6 +104,20 @@ final class ServerInfoProvider {
     private static void putIfNotNull(JSONObject obj, String key, String value) {
         if (value != null) {
             obj.put(key, value);
+        }
+    }
+
+    private static final class Snapshot {
+        final String hostname;
+        final String serverName;
+        final String ipAddress;
+        final String publisherId;
+
+        Snapshot(String hostname, String serverName, String ipAddress, String publisherId) {
+            this.hostname = hostname;
+            this.serverName = serverName;
+            this.ipAddress = ipAddress;
+            this.publisherId = publisherId;
         }
     }
 }
