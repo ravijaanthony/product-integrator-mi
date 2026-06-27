@@ -55,6 +55,7 @@ import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_ROLES;
 import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_SEQUENCES;
 import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_SERVER_DATA;
 import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_TASKS;
+import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_TASK_STATUS;
 import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_TEMPLATES;
 import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_TRANSACTION;
 import static org.wso2.micro.integrator.management.apis.Constants.PREFIX_USERS;
@@ -85,6 +86,7 @@ public class ManagementInternalApi implements InternalAPI {
         resourcesList.add(new CarbonAppResource(PREFIX_CARBON_APPS + PATH_PARAM_CARBON_APP_NAME));
         resourcesList.add(new CarbonAppResource(PREFIX_CARBON_APPS + PATH_PARAM_CARBON_APP_FAULT));
         resourcesList.add(new TaskResource(PREFIX_TASKS));
+        resourcesList.add(new CoordinatedTaskStatusResource(PREFIX_TASK_STATUS));
         resourcesList.add(new SequenceResource(PREFIX_SEQUENCES));
         resourcesList.add(new DataServiceResource(PREFIX_DATA_SERVICES));
         resourcesList.add(new TemplateResource(PREFIX_TEMPLATES));

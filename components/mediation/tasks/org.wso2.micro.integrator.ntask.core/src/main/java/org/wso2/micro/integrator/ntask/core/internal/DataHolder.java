@@ -59,6 +59,14 @@ public class DataHolder {
         return clusterCoordinator != null ? clusterCoordinator.getThisNodeId() : null;
     }
 
+    /**
+     * Returns the active coordinator's heartbeat retry interval in milliseconds. Management APIs use this
+     * through DataHolder so they do not need a direct dependency on the coordinator implementation.
+     */
+    public int getHeartbeatMaxRetryInterval() {
+        return clusterCoordinator != null ? clusterCoordinator.getHeartbeatMaxRetryInterval() : -1;
+    }
+
     public ScheduledTaskManager getTaskManager() {
         return taskManager;
     }

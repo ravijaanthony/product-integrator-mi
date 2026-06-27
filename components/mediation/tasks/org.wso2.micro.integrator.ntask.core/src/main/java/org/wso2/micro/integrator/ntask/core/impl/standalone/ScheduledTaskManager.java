@@ -45,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -63,7 +64,10 @@ public class ScheduledTaskManager extends AbstractQuartzTaskManager {
      */
     private List<TaskEntry> additionFailedTasks = new ArrayList<>();
 
-    private List<String> locallyRunningCoordinatedTasks = new ArrayList<>();
+    // The observation writer and local task status API read this list outside the scheduler thread, while
+    // task start/stop paths update it. CopyOnWriteArrayList gives those readers a stable snapshot without
+    // adding locks around the scheduler's normal path.
+    private final List<String> locallyRunningCoordinatedTasks = new CopyOnWriteArrayList<>();
 
     private SynapseEnvironment synapseEnvironment = null;
     private TaskStore taskStore;
@@ -443,7 +447,7 @@ public class ScheduledTaskManager extends AbstractQuartzTaskManager {
         if (synapseEnvironment == null) {
             synapseEnvironment = MicroIntegratorBaseUtils.getSynapseEnvironment();
         }
-        if (registry == null) { 
+        if (registry == null) {
             registry = synapseEnvironment.getSynapseConfiguration().getRegistry();
         }
     }

@@ -31,6 +31,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -91,6 +92,16 @@ import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.
 import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.UPDATE_MP_STATE;
 import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.UPDATE_TASK_STATUS_TO_DELETE_PENDING;
 import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.UPDATED_AT;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.DELETE_STALE_RUNNING_TASK_OBSERVATIONS_OF_NODE;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.INSERT_RUNNING_TASK_OBSERVATION;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.UPDATE_RUNNING_TASK_OBSERVATION;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.SELECT_FRESH_RUNNING_TASK_OBSERVATIONS;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.INSERT_DUPLICATION_EVENT;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.SELECT_OPEN_DUPLICATION_EVENTS;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.MARK_DUPLICATION_EVENT_SUSTAINED;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.CLOSE_DUPLICATION_EVENT;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.DETECTED_AT;
+import static org.wso2.micro.integrator.ntask.coordination.task.store.connector.TaskQueryHelper.SEVERITY;
 
 /**
  * The connector class which deals with underlying coordinated task table.
@@ -101,6 +112,9 @@ public class RDMBSConnector {
     private static final String ERROR_MSG = "Error while doing data base operation.";
     private static final String EMPTY_LIST = "Provided list is empty ";
     private static final String SQL_INTEGRITY_VIOLATION_CODE = "23";
+    // Statement timeout for best-effort monitoring queries. Connection acquisition is controlled by the
+    // datasource/pool; this timeout only applies after a PreparedStatement is created.
+    private static final int OBSERVATION_DB_TIMEOUT_SECONDS = 5;
     private static final String DELETE_PENDING_STATE = TASK_DELETE_PENDING_STATE;
     private static final Set<Integer> DUPLICATE_KEY_ERROR_CODES = Collections.unmodifiableSet(
             new HashSet<>(Arrays.asList(1, 1062, 2627, 2601, 803, -803)));
@@ -672,6 +686,190 @@ public class RDMBSConnector {
             return query(preparedStatement, "for unassigned incomplete tasks");
         } catch (SQLException ex) {
             throw new TaskCoordinationException(ERROR_MSG, ex);
+        }
+    }
+
+    /**
+     * Writes this node's current running task snapshot into RUNNING_TASK_OBSERVATION. Rows for tasks
+     * still running here are updated or inserted with the same timestamp, and older rows for this node
+     * are deleted in the same transaction so readers see either the old snapshot or the full new one.
+     *
+     * @param nodeId       node that is publishing the snapshot
+     * @param runningTasks coordinated tasks currently running on that node
+     * @param cycleTime    timestamp to store for every row in this snapshot, in epoch milliseconds
+     */
+    public void recordObservations(String nodeId, List<String> runningTasks, long cycleTime)
+            throws TaskCoordinationException {
+
+        Connection connection = null;
+        try {
+            connection = getTransactionalConnection();
+            for (String task : runningTasks) {
+                int updated;
+                try (PreparedStatement update = connection.prepareStatement(UPDATE_RUNNING_TASK_OBSERVATION)) {
+                    update.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+                    update.setLong(1, cycleTime);
+                    update.setString(2, nodeId);
+                    update.setString(3, task);
+                    updated = update.executeUpdate();
+                }
+                if (updated == 0) {
+                    try (PreparedStatement insert = connection.prepareStatement(INSERT_RUNNING_TASK_OBSERVATION)) {
+                        insert.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+                        insert.setString(1, nodeId);
+                        insert.setString(2, task);
+                        insert.setLong(3, cycleTime);
+                        insert.executeUpdate();
+                    } catch (SQLException ex) {
+                        // Another writer may have inserted the same (node, task) row after our UPDATE
+                        // found nothing. Treat that as success because the row now exists.
+                        if (!isIntegrityViolation(ex)) {
+                            throw ex;
+                        }
+                    }
+                }
+            }
+            try (PreparedStatement prune = connection.prepareStatement(
+                    DELETE_STALE_RUNNING_TASK_OBSERVATIONS_OF_NODE)) {
+                prune.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+                prune.setString(1, nodeId);
+                prune.setLong(2, cycleTime);
+                prune.executeUpdate();
+            }
+            connection.commit();
+        } catch (SQLException ex) {
+            rollbackQuietly(connection);
+            throw new TaskCoordinationException(ERROR_MSG, ex);
+        } finally {
+            closeQuietly(connection);
+        }
+    }
+
+    /**
+     * Reads observations that are still recent enough to count as "currently running", grouped by task.
+     * The leader uses the grouped result to find tasks observed on multiple nodes.
+     *
+     * @param minObservedAt oldest accepted OBSERVED_AT value, in epoch milliseconds
+     * @return task name to node ids that recently reported running that task
+     */
+    public Map<String, Set<String>> readFreshObservationsByTask(long minObservedAt) throws TaskCoordinationException {
+
+        Map<String, Set<String>> byTask = new HashMap<>();
+        try (Connection connection = getConnection(); PreparedStatement preparedStatement = connection.prepareStatement(
+                SELECT_FRESH_RUNNING_TASK_OBSERVATIONS)) {
+            preparedStatement.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+            preparedStatement.setLong(1, minObservedAt);
+            try (ResultSet resultSet = preparedStatement.executeQuery()) {
+                while (resultSet.next()) {
+                    byTask.computeIfAbsent(resultSet.getString(TASK_NAME), key -> new HashSet<>())
+                            .add(resultSet.getString(NODE_ID));
+                }
+            }
+        } catch (SQLException ex) {
+            throw new TaskCoordinationException(ERROR_MSG, ex);
+        }
+        return byTask;
+    }
+
+    /**
+     * Returns duplicate execution episodes that are still open. Closed episodes are kept for history and
+     * are intentionally ignored by the active detector.
+     *
+     * @return open duplicate episodes with task name, detection time, and severity
+     */
+    public List<DuplicationEpisode> getOpenDuplicationEpisodes() throws TaskCoordinationException {
+
+        List<DuplicationEpisode> episodes = new ArrayList<>();
+        try (Connection connection = getConnection(); PreparedStatement preparedStatement = connection.prepareStatement(
+                SELECT_OPEN_DUPLICATION_EVENTS); ResultSet resultSet = preparedStatement.executeQuery()) {
+            while (resultSet.next()) {
+                episodes.add(new DuplicationEpisode(resultSet.getString(TASK_NAME), resultSet.getLong(DETECTED_AT),
+                        resultSet.getString(SEVERITY)));
+            }
+        } catch (SQLException ex) {
+            throw new TaskCoordinationException(ERROR_MSG, ex);
+        }
+        return episodes;
+    }
+
+    /**
+     * Creates the first record for a newly detected duplicate task. The episode stays open until a later
+     * detection cycle clears it, and severity remains null until the overlap is classified.
+     */
+    public void openDuplicationEpisode(String taskName, String nodes, String destinedNode, long detectedAt,
+                                       String kind) throws TaskCoordinationException {
+
+        try (Connection connection = getConnection(); PreparedStatement preparedStatement = connection.prepareStatement(
+                INSERT_DUPLICATION_EVENT)) {
+            preparedStatement.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+            preparedStatement.setString(1, taskName);
+            preparedStatement.setString(2, nodes);
+            preparedStatement.setString(3, destinedNode);
+            preparedStatement.setLong(4, detectedAt);
+            preparedStatement.setString(5, kind);
+            preparedStatement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new TaskCoordinationException(ERROR_MSG, ex);
+        }
+    }
+
+    /**
+     * Marks the open episode as sustained after the same duplicate execution remains visible past the
+     * configured threshold.
+     */
+    public void markDuplicationEpisodeSustained(String taskName) throws TaskCoordinationException {
+
+        try (Connection connection = getConnection(); PreparedStatement preparedStatement = connection.prepareStatement(
+                MARK_DUPLICATION_EVENT_SUSTAINED)) {
+            preparedStatement.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+            preparedStatement.setString(1, taskName);
+            preparedStatement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new TaskCoordinationException(ERROR_MSG, ex);
+        }
+    }
+
+    /**
+     * Closes an episode when the duplicate overlap disappears. Episodes that were never marked sustained
+     * are classified as transient during this close.
+     */
+    public void closeDuplicationEpisode(String taskName, long clearedAt) throws TaskCoordinationException {
+
+        try (Connection connection = getConnection(); PreparedStatement preparedStatement = connection.prepareStatement(
+                CLOSE_DUPLICATION_EVENT)) {
+            preparedStatement.setQueryTimeout(OBSERVATION_DB_TIMEOUT_SECONDS);
+            preparedStatement.setLong(1, clearedAt);
+            preparedStatement.setString(2, taskName);
+            preparedStatement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new TaskCoordinationException(ERROR_MSG, ex);
+        }
+    }
+
+    /**
+     * Small immutable view of an open duplicate episode used by the leader detector.
+     */
+    public static final class DuplicationEpisode {
+        private final String taskName;
+        private final long detectedAt;
+        private final String severity;
+
+        public DuplicationEpisode(String taskName, long detectedAt, String severity) {
+            this.taskName = taskName;
+            this.detectedAt = detectedAt;
+            this.severity = severity;
+        }
+
+        public String getTaskName() {
+            return taskName;
+        }
+
+        public long getDetectedAt() {
+            return detectedAt;
+        }
+
+        public String getSeverity() {
+            return severity;
         }
     }
 

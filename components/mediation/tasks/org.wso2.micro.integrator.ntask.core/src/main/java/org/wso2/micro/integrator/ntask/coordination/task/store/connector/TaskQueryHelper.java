@@ -55,6 +55,55 @@ public class TaskQueryHelper {
     public static final String BARRIER_STATUS_FINALIZING = "FINALIZING";
     public static final String TASK_DELETE_PENDING_STATE = "DELETE_PENDING";
 
+    // Latest known running-task snapshot per (node, task), used by monitoring and duplicate detection.
+    public static final String RUNNING_TASK_OBSERVATION_TABLE = "RUNNING_TASK_OBSERVATION";
+    public static final String OBSERVED_AT = "OBSERVED_AT";
+
+    // Keep the update unconditional. Writes for a node are already serialized by the observation writer,
+    // and a timestamp guard would make future timestamps sticky after a clock step.
+    static final String UPDATE_RUNNING_TASK_OBSERVATION =
+            "UPDATE " + RUNNING_TASK_OBSERVATION_TABLE + " SET " + OBSERVED_AT + " = ? WHERE " + NODE_ID + " = ? AND "
+                    + TASK_NAME + " = ?";
+
+    static final String INSERT_RUNNING_TASK_OBSERVATION =
+            "INSERT INTO " + RUNNING_TASK_OBSERVATION_TABLE + " (" + NODE_ID + ", " + TASK_NAME + ", " + OBSERVED_AT
+                    + ") VALUES (?,?,?)";
+
+    static final String DELETE_STALE_RUNNING_TASK_OBSERVATIONS_OF_NODE =
+            "DELETE FROM " + RUNNING_TASK_OBSERVATION_TABLE + " WHERE " + NODE_ID + " = ? AND " + OBSERVED_AT + " < ?";
+
+    static final String SELECT_FRESH_RUNNING_TASK_OBSERVATIONS =
+            "SELECT " + NODE_ID + ", " + TASK_NAME + ", " + OBSERVED_AT + " FROM " + RUNNING_TASK_OBSERVATION_TABLE
+                    + " WHERE " + OBSERVED_AT +  " >= ?";
+
+    // History of duplicate-execution episodes opened and closed by the leader.
+    public static final String TASK_DUPLICATION_EVENT_TABLE = "TASK_DUPLICATION_EVENT";
+    public static final String NODES = "NODES";
+    public static final String DESTINED_NODE = "DESTINED_NODE";
+    public static final String DETECTED_AT = "DETECTED_AT";
+    public static final String CLEARED_AT = "CLEARED_AT";
+    public static final String SEVERITY = "SEVERITY";
+    public static final String TASK_KIND = "TASK_KIND";
+    public static final String SEVERITY_SUSTAINED = "SUSTAINED";
+    public static final String SEVERITY_TRANSIENT = "TRANSIENT";
+
+    static final String INSERT_DUPLICATION_EVENT =
+            "INSERT INTO " + TASK_DUPLICATION_EVENT_TABLE + " (" + TASK_NAME + ", " + NODES + ", " + DESTINED_NODE
+                    + ", " + DETECTED_AT + ", " + TASK_KIND + ") VALUES (?,?,?,?,?)";
+
+    static final String SELECT_OPEN_DUPLICATION_EVENTS =
+            "SELECT " + TASK_NAME + ", " + DETECTED_AT + ", " + SEVERITY + " FROM " + TASK_DUPLICATION_EVENT_TABLE
+                    + " WHERE " + CLEARED_AT + " IS NULL";
+
+    static final String MARK_DUPLICATION_EVENT_SUSTAINED =
+            "UPDATE " + TASK_DUPLICATION_EVENT_TABLE + " SET " + SEVERITY + " = '" + SEVERITY_SUSTAINED + "' WHERE "
+                    + TASK_NAME + " = ? AND " + CLEARED_AT + " IS NULL";
+
+    static final String CLOSE_DUPLICATION_EVENT =
+            "UPDATE " + TASK_DUPLICATION_EVENT_TABLE + " SET " + CLEARED_AT + " = ?, " + SEVERITY + " = CASE WHEN "
+                    + SEVERITY + " IS NULL THEN '" + SEVERITY_TRANSIENT + "' ELSE " + SEVERITY + " END WHERE "
+                    + TASK_NAME + " = ? AND " + CLEARED_AT + " IS NULL";
+
     private static final String TASK_STATE_CONST =
             "( CASE " + TASK_STATE + " WHEN '" + CoordinatedTask.States.RUNNING + "' THEN '"
                     + CoordinatedTask.States.NONE + "' WHEN '" + CoordinatedTask.States.DEACTIVATED + "'THEN '"
