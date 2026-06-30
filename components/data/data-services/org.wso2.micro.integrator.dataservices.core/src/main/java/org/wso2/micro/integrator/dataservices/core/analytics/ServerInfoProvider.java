@@ -1,7 +1,7 @@
 /*
- * Copyright (c) 2025, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
+ * Copyright (c) 2026, WSO2 LLC. (http://www.wso2.org) All Rights Reserved.
  *
- * WSO2 Inc. licenses this file to you under the Apache License,
+ * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.
  * You may obtain a copy of the License at
@@ -51,10 +51,10 @@ final class ServerInfoProvider {
         Snapshot snap = resolveSnapshot();
         JSONObject info = new JSONObject();
         if (snap != null) {
-            putIfNotNull(info, "hostname",   snap.hostname);
+            putIfNotNull(info, "hostname", snap.hostname);
             putIfNotNull(info, "serverName", snap.serverName);
-            putIfNotNull(info, "ipAddress",  snap.ipAddress);
-            putIfNotNull(info, "id",         snap.publisherId);
+            putIfNotNull(info, "ipAddress", snap.ipAddress);
+            putIfNotNull(info, "id", snap.publisherId);
         }
         return info;
     }
@@ -75,9 +75,9 @@ final class ServerInfoProvider {
                 // empty serverInfo for the JVM lifetime.
                 return null;
             }
-            String hostname    = info.getHostName();
-            String serverName  = info.getServerName();
-            String ipAddress   = info.getIpAddress();
+            String hostname = info.getHostName();
+            String serverName = info.getServerName();
+            String ipAddress = info.getIpAddress();
             String publisherId = AnalyticsConfig.getPublisherId(hostname);
             Snapshot fresh = new Snapshot(hostname, serverName, ipAddress, publisherId);
             cachedSnapshot = fresh;

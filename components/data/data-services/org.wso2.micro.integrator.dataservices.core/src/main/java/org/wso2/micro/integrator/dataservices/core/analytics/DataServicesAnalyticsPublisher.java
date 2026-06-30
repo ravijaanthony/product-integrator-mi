@@ -1,7 +1,7 @@
 /*
- * Copyright (c) 2025, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
+ * Copyright (c) 2026, WSO2 LLC. (http://www.wso2.org) All Rights Reserved.
  *
- * WSO2 Inc. licenses this file to you under the Apache License,
+ * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.
  * You may obtain a copy of the License at
@@ -80,7 +80,7 @@ public class DataServicesAnalyticsPublisher {
             "org.wso2.micro.integrator.analytics.messageflow.data.publisher.publish.elasticsearch.ElasticStatisticsPublisher";
 
     private static final Log analyticsLog = LogFactory.getLog(ELASTIC_PUBLISHER_LOGGER_NAME);
-    private static final Log log          = LogFactory.getLog(DataServicesAnalyticsPublisher.class);
+    private static final Log log = LogFactory.getLog(DataServicesAnalyticsPublisher.class);
 
     private DataServicesAnalyticsPublisher() {}
 
@@ -105,37 +105,37 @@ public class DataServicesAnalyticsPublisher {
         boolean isFailure = STATUS_FAILURE.equals(event.getStatus());
 
         JSONObject details = new JSONObject();
-        putIfNotNull(details, FIELD_DETAILS_NAME,      event.getServiceName());
+        putIfNotNull(details, FIELD_DETAILS_NAME, event.getServiceName());
         putIfNotNull(details, FIELD_DETAILS_OPERATION, event.getOperationName());
-        putIfNotNull(details, FIELD_DETAILS_SUB_TYPE,  event.getSubType());
+        putIfNotNull(details, FIELD_DETAILS_SUB_TYPE, event.getSubType());
 
         JSONObject metadata = new JSONObject();
         if (isFailure) {
-            putIfNotNull(metadata, METADATA_ERROR_CODE,    event.getErrorCode());
+            putIfNotNull(metadata, METADATA_ERROR_CODE, event.getErrorCode());
             putIfNotNull(metadata, METADATA_ERROR_MESSAGE, event.getErrorMessage());
-            putIfNotNull(metadata, METADATA_FAULT_DETAIL,  event.getFaultDetail());
+            putIfNotNull(metadata, METADATA_FAULT_DETAIL, event.getFaultDetail());
         }
 
         JSONObject payload = new JSONObject();
-        payload.put(FIELD_METADATA,             metadata);
-        payload.put(FIELD_ENTITY_TYPE,          ENTITY_TYPE_DATA_SERVICE);
-        payload.put(FIELD_ENTITY_CLASS_NAME,    ENTITY_CLASS_NAME_DATA_SERVICE);
-        payload.put(FIELD_FAILURE,              isFailure);
-        payload.put(FIELD_FAULT_RESPONSE,       isFailure);
-        payload.put(FIELD_LATENCY,              event.getLatency());
+        payload.put(FIELD_METADATA, metadata);
+        payload.put(FIELD_ENTITY_TYPE, ENTITY_TYPE_DATA_SERVICE);
+        payload.put(FIELD_ENTITY_CLASS_NAME, ENTITY_CLASS_NAME_DATA_SERVICE);
+        payload.put(FIELD_FAILURE, isFailure);
+        payload.put(FIELD_FAULT_RESPONSE, isFailure);
+        payload.put(FIELD_LATENCY, event.getLatency());
         payload.put(FIELD_DATA_SERVICE_DETAILS, details);
 
-        putIfNotNull(payload, FIELD_MESSAGE_ID,       event.getMessageId());
-        putIfNotNull(payload, FIELD_CORRELATION_ID,   event.getCorrelationId());
-        putIfNotNull(payload, FIELD_HTTP_METHOD,      event.getHttpMethod());
-        putIfNotNull(payload, FIELD_HTTP_URL,         event.getHttpUrl());
-        putIfNotNull(payload, FIELD_REMOTE_HOST,      event.getRemoteHost());
+        putIfNotNull(payload, FIELD_MESSAGE_ID, event.getMessageId());
+        putIfNotNull(payload, FIELD_CORRELATION_ID, event.getCorrelationId());
+        putIfNotNull(payload, FIELD_HTTP_METHOD, event.getHttpMethod());
+        putIfNotNull(payload, FIELD_HTTP_URL, event.getHttpUrl());
+        putIfNotNull(payload, FIELD_REMOTE_HOST, event.getRemoteHost());
 
         JSONObject root = new JSONObject();
-        root.put(FIELD_SERVER_INFO,    ServerInfoProvider.getServerInfo());
-        root.put(FIELD_TIMESTAMP,      toIsoTimestamp(event.getTimestamp()));
+        root.put(FIELD_SERVER_INFO, ServerInfoProvider.getServerInfo());
+        root.put(FIELD_TIMESTAMP, toIsoTimestamp(event.getTimestamp()));
         root.put(FIELD_SCHEMA_VERSION, SCHEMA_VERSION);
-        root.put(FIELD_PAYLOAD,        payload);
+        root.put(FIELD_PAYLOAD, payload);
         return root;
     }
 
