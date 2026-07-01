@@ -61,6 +61,14 @@
                     <groupId>commons-io.wso2</groupId>
                     <artifactId>commons-io</artifactId>
                 </exclusion>
+                <exclusion>
+                    <groupId>org.wso2.orbit.org.apache.tomcat</groupId>
+                    <artifactId>tomcat-servlet-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>javax.servlet</groupId>
+                    <artifactId>javax.servlet-api</artifactId>
+                </exclusion>
             </exclusions>
         </dependency>
         <dependency>
@@ -82,6 +90,19 @@
             <groupId>mysql</groupId>
             <artifactId>mysql-connector-java</artifactId>
             <scope>test</scope>
+        </dependency>
+        <!-- Servlet 3.1 API on the compile classpath only. ODataServiceHandler
+             overrides Servlet 3.1 methods (getContentLengthLong, changeSessionId,
+             upgrade, HttpUpgradeHandler) that aren't in equinox javax.servlet:3.0.0.
+             scope=provided: the OSGi container supplies javax.servlet.* at runtime
+             via Import-Package, so this jar must NOT be on the runtime classpath
+             nor pulled transitively into downstream modules (that's the same
+             reason the synapse-core / ndatasource.core servlet exclusions exist). -->
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>3.1.0</version>
+            <scope>provided</scope>
         </dependency>
         <dependency>
             <groupId>org.eclipse.equinox</groupId>
@@ -179,6 +200,28 @@
                 <exclusion>
                     <groupId> org.apache.synapse</groupId>
                     <artifactId>synapse-core</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.synapse</groupId>
+            <artifactId>synapse-core</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>javax.servlet</groupId>
+                    <artifactId>javax.servlet-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>jakarta.servlet</groupId>
+                    <artifactId>jakarta.servlet-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.tomcat</groupId>
+                    <artifactId>tomcat-servlet-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.tomcat.embed</groupId>
+                    <artifactId>tomcat-embed-core</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
