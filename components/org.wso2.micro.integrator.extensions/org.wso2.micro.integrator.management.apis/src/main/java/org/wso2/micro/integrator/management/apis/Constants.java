@@ -37,6 +37,7 @@ public class Constants {
     public static final String PREFIX_REGISTRY_METADATA = "/registry-resources/metadata";
     public static final String PREFIX_REGISTRY_PROPERTIES = "/registry-resources/properties";
     public static final String PREFIX_TASKS = "/tasks";
+    public static final String PREFIX_TASK_STATUS = "/task-status";
     public static final String PREFIX_SEQUENCES = "/sequences";
     public static final String PREFIX_LOGGING = "/logging";
     public static final String PREFIX_USERS = "/users";

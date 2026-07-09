@@ -34,10 +34,12 @@ import org.wso2.micro.integrator.ntask.coordination.task.ClusterCommunicator;
 import org.wso2.micro.integrator.ntask.coordination.task.CoordinatedTask;
 import org.wso2.micro.integrator.ntask.coordination.task.resolver.TaskLocationResolver;
 import org.wso2.micro.integrator.ntask.coordination.task.store.TaskStore;
+import org.wso2.micro.integrator.ntask.coordination.task.store.connector.RDMBSConnector;
 import org.wso2.micro.integrator.ntask.coordination.task.store.cleaner.TaskStoreCleaner;
 import org.wso2.micro.integrator.ntask.core.TaskUtils;
 import org.wso2.micro.integrator.ntask.core.impl.standalone.ScheduledTaskManager;
 import org.wso2.micro.integrator.ntask.core.internal.DataHolder;
+import org.wso2.micro.integrator.ntask.core.internal.TaskHandlingConfigUtils;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -45,6 +47,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Scheduler class, which runs periodically to retrieve all the scheduled tasks assigned to the node and schedule
@@ -65,6 +70,30 @@ public class CoordinatedTaskScheduler implements Runnable {
     private ScheduledTaskManager taskManager;
     private String localNodeId;
     private boolean isCoordinationStarted = true;
+
+    /**
+     * Runs best-effort observation writes outside the scheduler loop. The thread is daemon so it never
+     * holds shutdown, and the executor is static/single-threaded so rejoin cycles do not create extra
+     * writers or publish observations concurrently.
+     */
+    private static final ExecutorService OBSERVATION_DB_EXECUTOR = Executors.newSingleThreadExecutor(runnable
+            -> {
+        Thread thread = new Thread(runnable, "RunningTaskObservationDbWriter");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /**
+     * Last submitted observation write. If it is still running, the next scheduler cycle intentionally
+     * skips publishing instead of queuing another DB write with data that may already be stale.
+     */
+    private static volatile Future<?> observationWrite;
+
+    /**
+     * Prevents repeatedly logging the same timing warning when the configured freshness window cannot fit
+     * below the heartbeat retry interval.
+     */
+    private boolean freshnessWindowWarned = false;
 
     public CoordinatedTaskScheduler(ScheduledTaskManager taskManager, TaskStore taskStore,
                                     TaskLocationResolver taskLocationResolver, ClusterCommunicator connector) {
@@ -110,39 +139,171 @@ public class CoordinatedTaskScheduler implements Runnable {
                 addFailedTasks();
                 resolveCount++;
                 resolveUnassignedNotCompletedTasksAndUpdateStore();
+                // Only the leader opens, escalates, and closes duplicate-execution episodes.
+                detectDuplications();
             } else {
                 LOG.debug("This node is not leader. Hence not cleaning task store or resolving un assigned tasks.");
             }
             // schedule all tasks assigned to this node and in state none
             scheduleAssignedTasks(CoordinatedTask.States.NONE);
+            // Publish this node's local running set after scheduling decisions for this cycle are done.
+            recordRunningTaskObservations();
             checkInterrupted();
+        } catch (InterruptedException ie) {
+            // Expected during becameUnresponsive — shutdownNow interrupted this polling iteration.
+            // Not an error; cleanup runs in the finally block below.
+            LOG.warn("Coordinated task scheduler iteration interrupted"
+                    + "; exiting current iteration. Cleanup will run in finally block. ", ie);
         } catch (Throwable throwable) { // catching throwable to prohibit permanent stopping of the executor service.
             LOG.fatal("Unexpected error occurred while trying to schedule tasks.", throwable);
+        } finally {
+            // Backstop cleanup. If shutdownNow set the interrupt flag (TaskEventListener.becameUnresponsive
+            // ran) OR dataHolder cleared the scheduler reference, drain anything this iteration may have added to
+            // locallyRunningCoordinatedTasks before exiting. pauseAllLocallyRunningTasks is synchronized and idempotent —
+            // serializes with the heartbeat thread's call and the second caller's snapshot is empty/residue.
+            if (Thread.currentThread().isInterrupted() || DataHolder.getInstance().getTaskScheduler() == null) {
+                try {
+                    LOG.warn("Coordinated Task Scheduler is shutting down And Interrupt Detected. "
+                            + "Pausing all locally running tasks as part of final cleanup.");
+                    taskManager.pauseAllLocallyRunningTasks();
+                } catch (Throwable t) {
+                    LOG.error("Cleanup in finally failed.", t);
+                }
+            }
         }
     }
 
     /**
-     * Check if the task is interrupted.
+     * Publishes the tasks currently running on this node for monitoring and duplicate detection. This is
+     * best-effort telemetry: failures are logged, but they must not stop or delay task scheduling.
+     */
+    private void recordRunningTaskObservations() {
+        if (!TaskHandlingConfigUtils.isTaskMonitoringEnabled()) {
+            // Monitoring is opt-in; leave the observation tables untouched when it is disabled.
+            return;
+        }
+        // Keep DB turbulence away from the scheduler thread. At most one write is allowed in flight.
+        Future<?> pending = observationWrite;
+        if (pending != null && !pending.isDone()) {
+            // The previous write has not completed yet. Drop this cycle instead of building a backlog of
+            // observation writes that would be obsolete by the time they reach the database.
+            return;
+        }
+        observationWrite = OBSERVATION_DB_EXECUTOR.submit(() -> {
+            // Never let a telemetry failure kill the single writer thread; the next scheduler cycle can
+            // try again if the database has recovered.
+            try {
+                // Capture the running set inside the writer, not before submit. If the writer was delayed,
+                // this publishes a recent local view instead of a snapshot from an older scheduler cycle.
+                List<String> running = taskManager.getLocallyRunningCoordinatedTasks();
+                long cycleTime = System.currentTimeMillis();
+                taskStore.recordObservations(localNodeId, running, cycleTime);
+            } catch (Throwable t) {
+                LOG.warn("Failed to record running task observations for duplication detection "
+                        + "(coordination DB may be turbulent); will retry next cycle.");
+            }
+        });
+    }
+
+    /**
+     * Maintains the duplicate execution view from fresh observations written by all nodes. The leader
+     * opens an episode when the same task is seen on multiple nodes, marks it sustained if the overlap
+     * lasts long enough, and closes it when the overlap disappears.
+     */
+    private void detectDuplications() {
+        if (!TaskHandlingConfigUtils.isTaskMonitoringEnabled()) {
+            // Monitoring is opt-in; without observations there is nothing useful to detect.
+            return;
+        }
+        try {
+            long now = System.currentTimeMillis();
+            long freshnessWindow = resolveFreshnessWindowMs();
+            Map<String, Set<String>> freshByTask =
+                    taskStore.readFreshObservationsByTask(now - freshnessWindow);
+            Set<String> currentDuplicates = new HashSet<>();
+            for (Map.Entry<String, Set<String>> entry : freshByTask.entrySet()) {
+                if (entry.getValue().size() >= 2) {
+                    currentDuplicates.add(entry.getKey());
+                }
+            }
+
+            long sustainedThreshold = 2L * clusterCoordinator.getHeartbeatMaxRetryInterval();
+            Set<String> openTasks = new HashSet<>();
+            for (RDMBSConnector.DuplicationEpisode episode : taskStore.getOpenDuplicationEpisodes()) {
+                String task = episode.getTaskName();
+                openTasks.add(task);
+                if (currentDuplicates.contains(task)) {
+                    // The overlap is still present. Escalate only after it survives the configured grace period.
+                    if (episode.getSeverity() == null && (now - episode.getDetectedAt()) >= sustainedThreshold) {
+                        taskStore.markDuplicationEpisodeSustained(task);
+                        LOG.error("Coordinated task duplication SUSTAINED for " + (now - episode.getDetectedAt())
+                                + "ms - task [" + task + "] running on nodes " + freshByTask.get(task)
+                                + ". Likely concurrent execution / double processing; check node heartbeat "
+                                + "configuration.");
+                    }
+                } else {
+                    // The task no longer overlaps across nodes. Close the episode and classify it if needed.
+                    taskStore.closeDuplicationEpisode(task, now);
+                    String severity = episode.getSeverity() == null ? "TRANSIENT" : episode.getSeverity();
+                    LOG.warn("Coordinated task duplication CLEARED (" + severity + ") - task [" + task + "] lasted "
+                            + (now - episode.getDetectedAt()) + "ms.");
+                }
+            }
+
+            // Open an episode for each duplicate task that was not already being tracked.
+            Map<String, String> destinedByTask = null;
+            for (String task : currentDuplicates) {
+                if (openTasks.contains(task)) {
+                    continue;
+                }
+                if (destinedByTask == null) {
+                    destinedByTask = new HashMap<>();
+                    for (CoordinatedTask coordinatedTask : taskStore.getAllTaskNames()) {
+                        destinedByTask.put(coordinatedTask.getTaskName(), coordinatedTask.getDestinedNodeId());
+                    }
+                }
+                Set<String> nodes = freshByTask.get(task);
+                String destined = destinedByTask.get(task);
+                taskStore.openDuplicationEpisode(task, String.join(",", nodes), destined, now, "UNEXPECTED");
+                LOG.warn("Coordinated task duplication DETECTED - task [" + task + "] running on nodes " + nodes
+                        + "; DB owner [" + destined + "]. A node is running a coordinated task it does not own "
+                        + "(possible heartbeat / clock skew).");
+            }
+        } catch (Throwable t) {
+            LOG.warn("Coordinated task duplication detection cycle failed; will retry next cycle.");
+        }
+    }
+
+    /**
+     * Returns the observation age that still counts as "currently running". The value normally stays
+     * below the heartbeat retry interval so dead-node rows age out before reassignment. If configuration
+     * makes that impossible, live-node visibility wins and a warning is logged once.
      *
-     * @throws TaskCoordinationException when something goes wrong connecting to the store
+     * @return freshness window in milliseconds
+     */
+    private long resolveFreshnessWindowMs() {
+        int heartbeat = clusterCoordinator.getHeartbeatMaxRetryInterval();
+        long window = TaskHandlingConfigUtils.computeDuplicationFreshnessWindowMs(heartbeat);
+        if (heartbeat > 0 && window >= heartbeat && !freshnessWindowWarned) {
+            LOG.warn("Duplication-detection freshness window (" + window + "ms) is not below the heartbeat "
+                    + "retry interval (" + heartbeat + "ms); the heartbeat interval is configured very low, so "
+                    + "a normal coordinated-task failover may briefly register as a transient duplicate. Raise "
+                    + "the heartbeat interval for cleaner detection.");
+            freshnessWindowWarned = true;
+        }
+        return window;
+    }
+
+    /**
+     * Check if the task is interrupted. Cleanup is no longer done here — the finally block in run()
+     * is the single ownership point so that the heartbeat thread (TaskEventListener.becameUnresponsive)
+     * and the polling thread never iterate JmsConsumer.cleanup concurrently on the same consumer.
      */
     private void checkInterrupted() throws InterruptedException {
 
         if (Thread.currentThread().isInterrupted()) {
-            try {
-                List<String> tasks = taskManager.getLocallyRunningCoordinatedTasks();
-                // stop all running coordinated tasks.
-                tasks.forEach(task -> {
-                    try {
-                        taskManager.stopExecutionTemporarily(task);
-                    } catch (TaskException e) {
-                        LOG.error("Unable to pause the task " + task, e);
-                    }
-                });
-            } finally {
-                Thread.currentThread().interrupt();
-                throw new InterruptedException("Task was interrupted.");
-            }
+            Thread.currentThread().interrupt();
+            throw new InterruptedException("Thread was interrupted By the TaskEventListener.becameUnresponsive.");
         }
     }
 

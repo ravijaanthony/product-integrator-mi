@@ -24,7 +24,6 @@ import org.wso2.micro.integrator.coordination.ClusterCoordinator;
 import org.wso2.micro.integrator.coordination.MemberEventListener;
 import org.wso2.micro.integrator.coordination.RDBMSMemberEventCallBack;
 import org.wso2.micro.integrator.coordination.node.NodeDetail;
-import org.wso2.micro.integrator.ntask.common.TaskException;
 import org.wso2.micro.integrator.ntask.coordination.TaskCoordinationException;
 import org.wso2.micro.integrator.ntask.coordination.task.resolver.TaskLocationResolver;
 import org.wso2.micro.integrator.ntask.coordination.task.scehduler.CoordinatedTaskScheduler;
@@ -35,7 +34,6 @@ import org.wso2.micro.integrator.ntask.core.internal.CoordinatedTaskScheduleMana
 import org.wso2.micro.integrator.ntask.core.internal.DataHolder;
 import org.wso2.micro.integrator.ntask.core.internal.TaskHandlingConfigUtils;
 
-import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 
 /**
@@ -89,6 +87,21 @@ public class TaskEventListener extends MemberEventListener {
             LOG.debug("Member removed : " + nodeDetail.getNodeId());
         }
         String nodeId = nodeDetail.getNodeId();
+
+        // Liveness guard against stale MEMBER_REMOVED events. MEMBERSHIP_EVENT_TABLE delivery is async,
+        // and because the leader detects "removed" only after heartbeatMaxRetryInterval (~15s) while
+        // "added" is detected almost immediately, a queued MEMBER_REMOVED for nodeId can arrive AFTER
+        // nodeId has rejoined and re-INSERTed itself into CLUSTER_NODE_STATUS_TABLE. Acting on such a
+        // stale event would strip the rejoined node's task assignments while it is actively running
+        // them locally — producing orphan JmsConsumers on the broker. Skip the unAssign if the node
+        // is currently in the cluster; the leader-only TaskStoreCleaner remains the authoritative
+        // cleanup path for genuinely-removed nodes.
+        if (clusterCoordinator.getAllNodeIds().contains(nodeId)) {
+            LOG.info("Skipping stale memberRemoved for [" + nodeId
+                    + "] — node is currently in the cluster.");
+            return;
+        }
+
         if (taskDeleteBarrierEnabled) {
             try {
                 HotDeploymentWaveWaiter.waitForHotDeploymentWaveToSettle(taskStore, clusterCoordinator, LOG,
@@ -123,22 +136,24 @@ public class TaskEventListener extends MemberEventListener {
             taskScheduler.shutdownNow();
             dataHolder.setTaskScheduler(null);
         }
-        List<String> tasks = taskManager.getLocallyRunningCoordinatedTasks();
-        // stop all running coordinated tasks.
-        tasks.forEach(task -> {
-            try {
-                taskManager.stopExecutionTemporarily(task);
-            } catch (TaskException e) {
-                LOG.error("Unable to pause the task " + task, e);
-            }
-        });
 
-        try {
-            // Unassigns tasks from the specified node and updates their state in the task store.
-            taskStore.unAssignAndUpdateState(nodeId);
-        } catch (TaskCoordinationException e) {
-            LOG.error("Error while removing the tasks of this node.", e);
-        }
+        // Release JmsConsumers / scheduled-task resources held by this node. Shared synchronized
+        // path with the polling thread's run() finally block — the monitor serializes the two
+        // callers and the second one sees an empty list because stopExecutionTemporarily removes
+        // entries from the running list as it goes.
+        taskManager.pauseAllLocallyRunningTasks();
+
+        // unAssignAndUpdateState(nodeId) is intentionally NOT called here. Two other paths already
+        // do that work, and adding it here was creating a third concurrent writer racing against
+        // the same TaskStore.cleanup lock — under sustained DB stalls this race produced duplicate
+        // FATAL stack traces and stalled the coordinator scheduler.
+        //   1. reJoined(nodeId) — fires on this node when DB recovers, calls unAssignAndUpdateState
+        //      and restarts the scheduler. Now that wasMemberUnresponsive is set BEFORE
+        //      notifyUnresponsiveness, this path is guaranteed to fire on recovery.
+        //   2. The leader's TaskStoreCleaner — runs every leader iteration against the current
+        //      CLUSTER_NODE_STATUS_TABLE and unassigns tasks of any genuinely-absent node.
+        // Either path will mark this node's tasks unassigned; doing it a third time here only
+        // adds contention and gains nothing.
     }
 
 

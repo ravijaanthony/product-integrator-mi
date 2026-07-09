@@ -24,6 +24,7 @@ import org.wso2.micro.integrator.ntask.coordination.task.store.connector.RDMBSCo
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import javax.sql.DataSource;
 
 /**
@@ -360,6 +361,56 @@ public class TaskStore {
     public List<String> recoverExpiredOrAbandonedDeleteBarriers(List<String> liveNodeIds, long currentTime)
             throws TaskCoordinationException {
         return rdmbsConnector.recoverExpiredOrAbandonedDeleteBarriers(liveNodeIds, currentTime);
+    }
+
+    /**
+     * Replaces this node's previous running-task observation with the tasks seen in the current scheduler
+     * cycle. The timestamp is supplied by the caller so every row from one publish uses the same cycle time.
+     *
+     * @param nodeId       node that owns the observation rows
+     * @param runningTasks coordinated tasks currently running on that node
+     * @param cycleTime    publish time for this observation batch, in epoch milliseconds
+     */
+    public void recordObservations(String nodeId, List<String> runningTasks, long cycleTime)
+            throws TaskCoordinationException {
+        rdmbsConnector.recordObservations(nodeId, runningTasks, cycleTime);
+    }
+
+    /**
+     * Returns recent observations grouped as task name to node ids, which is the shape the leader needs
+     * to decide whether a task is running on more than one node.
+     */
+    public Map<String, Set<String>> readFreshObservationsByTask(long minObservedAt) throws TaskCoordinationException {
+        return rdmbsConnector.readFreshObservationsByTask(minObservedAt);
+    }
+
+    /**
+     * Returns duplicate execution episodes that have been detected but not yet closed.
+     */
+    public List<RDMBSConnector.DuplicationEpisode> getOpenDuplicationEpisodes() throws TaskCoordinationException {
+        return rdmbsConnector.getOpenDuplicationEpisodes();
+    }
+
+    /**
+     * Starts tracking a newly observed duplicate execution for one task.
+     */
+    public void openDuplicationEpisode(String taskName, String nodes, String destinedNode, long detectedAt,
+                                       String kind) throws TaskCoordinationException {
+        rdmbsConnector.openDuplicationEpisode(taskName, nodes, destinedNode, detectedAt, kind);
+    }
+
+    /**
+     * Marks an open duplicate execution episode as sustained after it survives the grace period.
+     */
+    public void markDuplicationEpisodeSustained(String taskName) throws TaskCoordinationException {
+        rdmbsConnector.markDuplicationEpisodeSustained(taskName);
+    }
+
+    /**
+     * Closes the open duplicate execution episode once the task is no longer observed on multiple nodes.
+     */
+    public void closeDuplicationEpisode(String taskName, long clearedAt) throws TaskCoordinationException {
+        rdmbsConnector.closeDuplicationEpisode(taskName, clearedAt);
     }
 
 }

@@ -45,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -63,7 +64,10 @@ public class ScheduledTaskManager extends AbstractQuartzTaskManager {
      */
     private List<TaskEntry> additionFailedTasks = new ArrayList<>();
 
-    private List<String> locallyRunningCoordinatedTasks = new ArrayList<>();
+    // The observation writer and local task status API read this list outside the scheduler thread, while
+    // task start/stop paths update it. CopyOnWriteArrayList gives those readers a stable snapshot without
+    // adding locks around the scheduler's normal path.
+    private final List<String> locallyRunningCoordinatedTasks = new CopyOnWriteArrayList<>();
 
     private SynapseEnvironment synapseEnvironment = null;
     private TaskStore taskStore;
@@ -281,6 +285,25 @@ public class ScheduledTaskManager extends AbstractQuartzTaskManager {
         locallyRunningCoordinatedTasks.remove(taskName);
     }
 
+    /**
+     * Pause every locally running coordinated task in a single synchronized pass. Both
+     * TaskEventListener.becameUnresponsive (heartbeat thread) and CoordinatedTaskScheduler.run's
+     * finally block (polling thread) call this; they serialize on the `this` monitor — same monitor
+     * as the inherited pauseLocalTaskTemporarily / scheduleLocalTask methods. The snapshot is taken
+     * inside the lock so a concurrent caller sees the post-removal residue (typically empty).
+     */
+    @Override
+    public synchronized void pauseAllLocallyRunningTasks() {
+        List<String> tasks = new ArrayList<>(locallyRunningCoordinatedTasks);
+        tasks.forEach(task -> {
+            try {
+                stopExecutionTemporarily(task);
+            } catch (Throwable t) {
+                log.error("Unable to pause the task " + task, t);
+            }
+        });
+    }
+
     private void scheduleTask(String taskName) throws TaskException {
         if (this.isMyTaskTypeRegistered()) {
             this.scheduleLocalTask(taskName);
@@ -443,7 +466,7 @@ public class ScheduledTaskManager extends AbstractQuartzTaskManager {
         if (synapseEnvironment == null) {
             synapseEnvironment = MicroIntegratorBaseUtils.getSynapseEnvironment();
         }
-        if (registry == null) { 
+        if (registry == null) {
             registry = synapseEnvironment.getSynapseConfiguration().getRegistry();
         }
     }
